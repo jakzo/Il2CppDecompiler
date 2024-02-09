@@ -20,7 +20,7 @@ import ghidra.app.script.*;
 import ghidra.framework.options.ToolOptions;
 import ghidra.util.exception.CancelledException;
 
-public class DecompileToCSharp extends GhidraScript {
+public class Il2CppDecompiler extends GhidraScript {
 	private static NumberFormat usdFormatter = NumberFormat.getCurrencyInstance(Locale.US);
 
 	ProjectData projectData = new ProjectData();
@@ -57,26 +57,38 @@ public class DecompileToCSharp extends GhidraScript {
 			// var tokgroup = results.getCCodeMarkup();
 			// var hfunc = results.getHighFunction();
 			// for (var block : hfunc.getBasicBlocks()) {
-			// System.out.println(block.toString());
+			// println(block.toString());
 			// var iter = block.getIterator();
 			// while (iter.hasNext()) {
 			// var op = iter.next();
-			// System.out.println(op.toString());
+			// println(op.toString());
 			// }
 			// }
 
 			splitAllVars();
 
 			var cCode = results.getDecompiledFunction().getC();
-			projectData.saveFile("results/decompGhidra.c", cCode);
+			var filePrefix = "results/" + func.getName() + "/";
+			projectData.saveFile(filePrefix + "decompGhidra.c", cCode);
+
+			var unnamedFuncMatcher = Pattern.compile("\\bFUN_[0-9a-f]+\\b").matcher(cCode);
+			if (unnamedFuncMatcher.find()) {
+				var funcs = unnamedFuncMatcher.group(0);
+				while (unnamedFuncMatcher.find()) {
+					funcs += ", " + unnamedFuncMatcher.group(0);
+				}
+				throw new Exception("Method contains calls to unnamed functions: " + funcs);
+			}
 
 			// var csStrCode = new HackyStringReplaceTranspiler().convertToCs(cCode);
-			// projectData.saveFile("results/decompStr.cs", csStrCode);
+			// projectData.saveFile(filePrefix + "decompStr.cs", csStrCode);
 
-			var csLlmCode = transpiler.convertToCs(cCode);
-			projectData.saveFile("results/decompLlm.cs", csLlmCode);
+			var csLlmCode = transpiler.convertToCs(cCode, filePrefix);
+			var finalOutputRelPath = filePrefix + "decompLlm.cs";
+			projectData.saveFile(finalOutputRelPath, csLlmCode);
 
-			System.out.println("Decompilation complete!");
+			println("Decompiled to: " +
+					projectData.getProjectFile(finalOutputRelPath).getAbsolutePath());
 		} finally {
 			decomp.dispose();
 		}
@@ -91,7 +103,7 @@ public class DecompileToCSharp extends GhidraScript {
 		monitor.increment();
 		monitor.setMessage(message);
 		if (isRunningHeadless()) {
-			System.out.println(message);
+			println(message);
 		}
 	}
 
@@ -248,7 +260,7 @@ public class DecompileToCSharp extends GhidraScript {
 		}
 
 		private String readOutputFile(String filename) throws IOException {
-			var file = projectData.getProjectFile("Il2CppDumperOutput/" + filename);
+			var file = projectData.getProjectFile("DumperOutput/" + filename);
 			if (!file.exists()) {
 				file.getParentFile().mkdirs();
 				Files.copy(Path.of(outputDir, filename), file.toPath());
@@ -331,6 +343,26 @@ public class DecompileToCSharp extends GhidraScript {
 			}
 		}
 
+		private static Map<String, String> operatorsByName = Map.ofEntries(
+				Map.entry("Implicit", "implicit"),
+				Map.entry("Explicit", "explicit"),
+				Map.entry("Addition", "+"),
+				Map.entry("Subtraction", "-"),
+				Map.entry("Multiply", "*"),
+				Map.entry("Division", "/"),
+				Map.entry("Modulus", "%"),
+				Map.entry("Equality", "=="),
+				Map.entry("Inequality", "!="),
+				Map.entry("GreaterThan", ">"),
+				Map.entry("LessThan", "<"),
+				Map.entry("GreaterThanOrEqual", ">="),
+				Map.entry("LessThanOrEqual", "<="),
+				Map.entry("LeftShift", "<<"),
+				Map.entry("RightShift", ">>"),
+				Map.entry("Increment", "++"),
+				Map.entry("Decrement", "--"),
+				Map.entry("UnaryNegation", "-"));
+
 		private static void parseMethods(String raw, Il2CppDecompilerType type) {
 			if (raw == null)
 				return;
@@ -354,6 +386,15 @@ public class DecompileToCSharp extends GhidraScript {
 						continue;
 					}
 				}
+
+				if (name.startsWith("op_")) {
+					var operatorName = name.substring(3);
+					var operator = operatorsByName.get(operatorName);
+					if (operator != null) {
+						contents = contents.replace(name, "operator " + operator);
+					}
+				}
+
 				type.items.put(headerFixName(name), cleanItem(contents));
 			}
 		}
@@ -505,7 +546,7 @@ public class DecompileToCSharp extends GhidraScript {
 	public class LlmTranspiler {
 		public int stepCount = 3;
 
-		public String convertToCs(String cCode) throws Exception {
+		public String convertToCs(String cCode, String filePrefix) throws Exception {
 			onProgress("Parsing Il2CppDumper output");
 			var dumperDir = projectData.getIl2CppDumperOutputDir(true);
 			var il2CppDecompilerOutput = new Il2CppDecompilerOutput(dumperDir);
@@ -524,29 +565,29 @@ public class DecompileToCSharp extends GhidraScript {
 			}
 
 			onProgress("LLM call 1: refactoring to C#");
-			var apiKey = projectData.getOpenAiApiKey(true);
-			var openai = new OpenAI(apiKey);
 			var prompt1 = generateLlmConvertToCsPrompt(simplifiedCCode, il2CppDecompilerOutput);
-			projectData.saveFile("results/llm_call_1_prompt.md", prompt1);
+			projectData.saveFile(filePrefix + "llm_call_1_prompt.md", prompt1);
 			var messages = new ArrayList<>(Arrays.asList(new OpenAI.Message("user", prompt1)));
 			var req1 = OpenAI.Request.withDefaults(messages);
 
 			var inputLen1 = prompt1.length();
-			var approxOutputLen = (int) (inputLen1 * 0.5);
+			var approxOutputLen = (int) (inputLen1 * 0.1);
 			var inputLen2 = inputLen1 + approxOutputLen;
 			var approximateCost = OpenAI.estimateCost(inputLen1 + inputLen2, approxOutputLen * 2);
 			var estimateCostText = "Estimated cost of querying the LLM is approximately " +
 					usdFormatter.format(approximateCost) + " USD.";
 			if (isRunningHeadless()) {
-				System.out.println(estimateCostText);
+				println(estimateCostText);
 			} else {
 				askYesNo("Proceed", estimateCostText + " Do you want to proceed?");
 			}
 
+			var apiKey = projectData.getOpenAiApiKey(true);
+			var openai = new OpenAI(apiKey);
 			var res1 = openai.getCompletion(req1);
 			var outputMessage1 = res1.choices.get(0).message;
 			var output1 = outputMessage1.content;
-			projectData.saveFile("results/llm_call_1_response.md", output1);
+			projectData.saveFile(filePrefix + "llm_call_1_response.md", output1);
 
 			var prompt2Parts = new ArrayList<String>();
 
@@ -577,15 +618,15 @@ public class DecompileToCSharp extends GhidraScript {
 
 			var prompt2 = "Fix the following potential issues then output just the code with no explanation:\n\n- "
 					+ String.join("\n- ", prompt2Parts);
-			projectData.saveFile("results/llm_call_2_prompt.md", prompt2);
+			projectData.saveFile(filePrefix + "llm_call_2_prompt.md", prompt2);
 			messages.add(outputMessage1);
 			messages.add(new OpenAI.Message("user", prompt2));
 			var req2 = OpenAI.Request.withDefaults(messages);
 			var res2 = openai.getCompletion(req2);
 			var output2 = res2.choices.get(0).message.content;
-			projectData.saveFile("results/llm_call_2_response.md", output2);
+			projectData.saveFile(filePrefix + "llm_call_2_response.md", output2);
 
-			System.out.println("LLM done, total cost is " + usdFormatter.format(openai.getTotalCost()) + " USD.");
+			println("LLM done, total cost is " + usdFormatter.format(openai.getTotalCost()) + " USD.");
 
 			return parseLlmOutput(output2, type.namespace);
 		}
@@ -609,6 +650,7 @@ public class DecompileToCSharp extends GhidraScript {
 
 		private String generateLlmConvertToCsPrompt(String decompiledC,
 				Il2CppDecompilerOutput il2CppDecompilerOutput) {
+			// TODO: Iterate over tokens in decompiled C instead of string search
 			var usedTypes = il2CppDecompilerOutput.typeKeys.search(decompiledC);
 			var typeContext = "";
 			for (var typeCName : usedTypes) {
@@ -711,7 +753,7 @@ public class DecompileToCSharp extends GhidraScript {
 
 					var response = client.send(request, BodyHandlers.ofString());
 					if (response.statusCode() < 200 || response.statusCode() >= 300) {
-						System.err.println("LLM response body: " + response.body());
+						printerr("LLM response body: " + response.body());
 						throw new Exception("LLM request failed with status code: " + response.statusCode());
 					}
 					res = gson.fromJson(response.body(), Response.class);
@@ -720,12 +762,7 @@ public class DecompileToCSharp extends GhidraScript {
 				totalInputTokens += res.usage.prompt_tokens;
 				totalOutputTokens += res.usage.completion_tokens;
 
-				var inputCost = res.usage.prompt_tokens / 1000.0 * COST_INPUT_1K_TOKENS;
-				var outputCost = res.usage.completion_tokens / 1000.0 * COST_OUTPUT_1K_TOKENS;
-				System.out.println("Request to LLM cost: " +
-						usdFormatter.format(inputCost + outputCost) + " USD");
-
-				System.out.println("Input tokens: " + res.usage.prompt_tokens +
+				println("LLM input tokens: " + res.usage.prompt_tokens +
 						", output tokens: " + res.usage.completion_tokens);
 
 				return res;
@@ -738,7 +775,7 @@ public class DecompileToCSharp extends GhidraScript {
 			}
 
 			private boolean isMockEnabled() {
-				return apiKey == "mock";
+				return apiKey.equals("mock");
 			}
 
 			public class Mocks {
@@ -798,7 +835,6 @@ public class DecompileToCSharp extends GhidraScript {
 				private static int mockResponseIndex = 0;
 
 				public static Response getCompletion(Request req) {
-					System.out.println("LLM mock response sent");
 					var gson = new Gson();
 					var json = MOCK_RESPONSES[mockResponseIndex++ % MOCK_RESPONSES.length];
 					return gson.fromJson(json, Response.class);
@@ -835,12 +871,14 @@ public class DecompileToCSharp extends GhidraScript {
 				Message message;
 			}
 
+			@SuppressWarnings("unused")
 			public static class Usage {
 				int completion_tokens;
 				int prompt_tokens;
 				int total_tokens;
 			}
 
+			@SuppressWarnings("unused")
 			public static class Message {
 				public String role;
 				public String content;
